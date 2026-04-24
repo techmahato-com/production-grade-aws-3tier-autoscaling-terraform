@@ -127,6 +127,56 @@ DevOps Team will design and implement a cloud-native infrastructure on AWS for h
 
 ---
 
+## 🔄 Complete Traffic Flow (Step by Step)
+
+Understanding how a user request travels through the entire infrastructure:
+
+```
+Step 1: User types the URL in browser
+        ↓
+Step 2: DNS resolves to External ALB's public IP
+        ↓
+Step 3: AWS WAF inspects the request FIRST
+        - Is this IP sending > 2000 requests/5min? → BLOCK (rate limiting)
+        - Does the request contain SQL injection patterns? → BLOCK
+        - Does it match known bad input patterns? → BLOCK
+        - Clean request? → ALLOW, pass to ALB
+        ↓
+Step 4: External ALB (internet-facing, lives in PUBLIC subnet)
+        - Receives the request on port 80
+        - Runs health check: "Is Nginx healthy?"
+        - Picks a healthy Nginx instance using round-robin
+        - Forwards request to Nginx on port 80
+        ↓
+Step 5: Nginx (lives in PRIVATE web subnet — NO public IP)
+        - Receives request from ALB
+        - Adds security headers:
+          • X-Frame-Options: SAMEORIGIN (prevents clickjacking)
+          • X-Content-Type-Options: nosniff (prevents MIME sniffing)
+          • X-XSS-Protection: 1; mode=block
+        - Acts as reverse proxy → forwards to Internal ALB on port 8080
+        ↓
+Step 6: Internal ALB (lives in PRIVATE app subnet)
+        - Receives request from Nginx
+        - Picks a healthy Tomcat instance
+        - Forwards to Tomcat on port 8080
+        ↓
+Step 7: Tomcat (lives in PRIVATE app subnet — NO public IP)
+        - Java/Spring Boot app processes the request
+        - Needs data? Connects to RDS on port 3306
+        ↓
+Step 8: RDS MySQL (lives in ISOLATED private subnet — NO internet at all)
+        - Processes the SQL query
+        - Returns data to Tomcat
+        ↓
+Step 9: Response travels back:
+        RDS → Tomcat → Internal ALB → Nginx → External ALB → User
+```
+
+> 📌 At no point does the user's request directly touch Nginx, Tomcat, or RDS. Everything goes through load balancers. This is the **defense-in-depth** model.
+
+---
+
 ## 🏛️ Solution Architecture & Implementation
 
 ### Target Architecture on AWS
@@ -224,13 +274,13 @@ The implementation will be executed in structured phases:
 ```
 production-grade-aws-3tier-autoscaling-terraform/
 ├── modules/
-│   ├── vpc/                    # VPC, Subnets, IGW, NAT, Route Tables
+│   ├── vpc/                    # VPC, Subnets, IGW, NAT, Route Tables, Flow Logs
 │   ├── security/               # Security Groups, NACLs, IAM Roles
 │   ├── bastion/                # Bastion Host in Public Subnet
 │   ├── alb/                    # Application Load Balancers (External + Internal)
-│   ├── asg/                    # Launch Templates, Auto Scaling Groups
-│   ├── rds/                    # RDS MySQL Multi-AZ, Subnet Groups
-│   ├── monitoring/             # CloudWatch Dashboards, Alarms, Log Groups
+│   ├── asg/                    # Launch Templates, Auto Scaling Groups, Scaling Policies
+│   ├── rds/                    # RDS MySQL Multi-AZ, Secrets Manager, Parameter Groups
+│   ├── monitoring/             # CloudWatch Dashboards, Alarms, SNS, Log Groups
 │   └── waf/                    # AWS WAF Rules and Web ACL
 ├── environments/
 │   ├── dev/                    # Dev environment tfvars
@@ -246,10 +296,456 @@ production-grade-aws-3tier-autoscaling-terraform/
 ├── outputs.tf                  # Output values
 ├── providers.tf                # AWS provider configuration
 ├── backend.tf                  # S3 + DynamoDB remote state
-├── terraform.tfvars            # Default variable values
 ├── .gitignore
 ├── LICENSE
 └── README.md
+```
+
+### Module Responsibilities
+
+| Module | Files | What It Provisions |
+|--------|-------|--------------------|
+| `modules/vpc/` | 3 | VPC, 8 subnets, IGW, 2 NAT GWs, route tables, VPC Flow Logs |
+| `modules/security/` | 3 | 6 Security Groups, NACLs per tier, IAM role + instance profile |
+| `modules/bastion/` | 3 | Bastion EC2 in public subnet, hardened with IMDSv2 |
+| `modules/alb/` | 3 | External ALB + Internal ALB, target groups, health checks, listeners |
+| `modules/asg/` | 3 | Launch templates + ASGs for Nginx & Tomcat, scaling policies + alarms |
+| `modules/rds/` | 3 | RDS MySQL Multi-AZ, Secrets Manager, parameter group, subnet group |
+| `modules/monitoring/` | 3 | SNS topic, CloudWatch alarms (RDS/ALB), dashboard, log groups |
+| `modules/waf/` | 3 | WAF Web ACL with rate limiting + AWS managed rules |
+
+---
+
+## 🌐 Network Deep Dive
+
+### VPC Structure
+
+```
+VPC: 10.0.0.0/16 (65,536 IP addresses)
+│
+├── Public Subnets (internet-accessible)
+│   ├── 10.0.1.0/24 (AZ-1a) — Bastion, NAT GW, External ALB
+│   └── 10.0.2.0/24 (AZ-1b) — Bastion, NAT GW, External ALB
+│
+├── Private Web Subnets (Nginx — no public IP)
+│   ├── 10.0.11.0/24 (AZ-1a)
+│   └── 10.0.12.0/24 (AZ-1b)
+│
+├── Private App Subnets (Tomcat — no public IP)
+│   ├── 10.0.21.0/24 (AZ-1a)
+│   └── 10.0.22.0/24 (AZ-1b)
+│
+└── Private DB Subnets (RDS — FULLY ISOLATED, no internet at all)
+    ├── 10.0.31.0/24 (AZ-1a)
+    └── 10.0.32.0/24 (AZ-1b)
+```
+
+### Why 8 Subnets?
+
+Each tier gets its own subnet pair (one per AZ) because:
+- **Isolation**: Different NACLs per tier
+- **Blast radius**: If web tier is compromised, app/db subnets have separate firewall rules
+- **Compliance**: Many audits require network-level separation between tiers
+- **Independent scaling**: Each tier can grow without IP conflicts
+
+### Route Tables — Who Can Reach What?
+
+```
+Public Route Table:
+  10.0.0.0/16  → local (VPC internal)
+  0.0.0.0/0    → Internet Gateway         ← Makes it "public"
+
+Private Route Table (AZ-1a):
+  10.0.0.0/16  → local (VPC internal)
+  0.0.0.0/0    → NAT Gateway (AZ-1a)      ← Can reach internet for updates,
+                                              but internet CANNOT reach back in
+
+Private Route Table (AZ-1b):
+  10.0.0.0/16  → local (VPC internal)
+  0.0.0.0/0    → NAT Gateway (AZ-1b)      ← Separate NAT GW for HA
+
+DB Route Table:
+  10.0.0.0/16  → local (VPC internal)     ← THAT'S IT. No internet route.
+                                              DB can only talk within the VPC.
+```
+
+**Why 2 NAT Gateways?** If you use one NAT GW in AZ-1a and that AZ goes down, all private instances in AZ-1b lose internet access (can't download updates, can't push CloudWatch metrics). With one per AZ, each AZ is self-sufficient.
+
+**Why DB has no NAT route?** The database should NEVER need to reach the internet. It only needs to talk to Tomcat instances within the VPC. Even if someone compromises the DB, they can't exfiltrate data to the internet.
+
+### VPC Flow Logs
+
+Every network packet in the VPC is logged:
+```
+Source IP → Destination IP → Port → Protocol → Accept/Reject → Timestamp
+```
+Stored in CloudWatch Logs with 30-day retention. Useful for security forensics, troubleshooting, and compliance audits.
+
+---
+
+## 🔐 Security Deep Dive
+
+### Security Group Chain (The Trust Chain)
+
+This is the most critical security design. Each SG only allows traffic from the previous tier's SG:
+
+```
+                    ┌─────────────────────────────────────────────┐
+                    │         SECURITY GROUP CHAIN                │
+                    │                                             │
+  Internet ──80/443──→ [External ALB SG]                         │
+                    │       │                                     │
+                    │       ├──80──→ [Web SG] (Nginx)             │
+                    │       │           │                         │
+                    │       │           ├──8080──→ [Internal ALB SG]
+                    │       │           │              │          │
+                    │       │           │              ├──8080──→ [App SG] (Tomcat)
+                    │       │           │              │              │
+                    │       │           │              │              ├──3306──→ [DB SG] (RDS)
+                    │       │           │              │              │
+  Trusted IP ──22──→ [Bastion SG]──22──→ [Web SG]     │              │
+                    │              ──22──→ [App SG]    │              │
+                    └─────────────────────────────────────────────┘
+```
+
+### Security Group Rules Explained
+
+**Bastion SG:**
+| Direction | Port | Source | Why |
+|-----------|------|--------|-----|
+| Inbound | 22 (SSH) | `allowed_ssh_cidrs` only | Only your trusted IP can attempt SSH |
+| Outbound | All | 0.0.0.0/0 | Needs to SSH into private instances |
+
+**External ALB SG:**
+| Direction | Port | Source | Why |
+|-----------|------|--------|-----|
+| Inbound | 80 (HTTP) | 0.0.0.0/0 | Must accept traffic from entire internet |
+| Inbound | 443 (HTTPS) | 0.0.0.0/0 | Must accept traffic from entire internet |
+| Outbound | All | 0.0.0.0/0 | Forwards to Nginx |
+
+**Web SG (Nginx):**
+| Direction | Port | Source | Why |
+|-----------|------|--------|-----|
+| Inbound | 80 | External ALB SG | HTTP only from ALB — NOT from internet directly |
+| Inbound | 22 | Bastion SG | SSH only from Bastion — not from anywhere else |
+| Outbound | All | 0.0.0.0/0 | Forwards to Internal ALB |
+
+**Internal ALB SG:**
+| Direction | Port | Source | Why |
+|-----------|------|--------|-----|
+| Inbound | 8080 | Web SG | Only Nginx can send traffic here |
+| Outbound | All | 0.0.0.0/0 | Forwards to Tomcat |
+
+**App SG (Tomcat):**
+| Direction | Port | Source | Why |
+|-----------|------|--------|-----|
+| Inbound | 8080 | Internal ALB SG | Only Internal ALB can reach Tomcat |
+| Inbound | 22 | Bastion SG | SSH only from Bastion |
+| Outbound | All | 0.0.0.0/0 | Connects to RDS, pushes CloudWatch metrics |
+
+**DB SG (RDS):**
+| Direction | Port | Source | Why |
+|-----------|------|--------|-----|
+| Inbound | 3306 | App SG only | ONLY Tomcat can talk to the database |
+| Outbound | All | VPC only | No internet route — responses stay within VPC |
+
+### What Happens If Nginx Is Compromised?
+
+- Attacker can reach Internal ALB on 8080 — that's it
+- They **CANNOT** reach RDS (DB SG only allows from App SG)
+- They **CANNOT** SSH to Tomcat (App SG only allows SSH from Bastion SG)
+- The blast radius is contained to the web tier
+
+### NACLs (Network ACLs) — Second Layer of Defense
+
+NACLs are **stateless** firewalls at the subnet level (SGs are stateful):
+
+**Web NACL:**
+```
+Inbound:
+  Rule 100: Allow TCP 80 from VPC CIDR (HTTP from ALB)
+  Rule 110: Allow TCP 22 from VPC CIDR (SSH from Bastion)
+  Rule 200: Allow TCP 1024-65535 from 0.0.0.0/0 (return traffic)
+Outbound:
+  Rule 100: Allow ALL outbound
+```
+
+**App NACL:**
+```
+Inbound:
+  Rule 100: Allow TCP 8080 from VPC CIDR (Tomcat from Internal ALB)
+  Rule 110: Allow TCP 22 from VPC CIDR (SSH from Bastion)
+  Rule 200: Allow TCP 1024-65535 from 0.0.0.0/0 (return traffic)
+Outbound:
+  Rule 100: Allow ALL outbound
+```
+
+**DB NACL (Most Restrictive):**
+```
+Inbound:
+  Rule 100: Allow TCP 3306 from VPC CIDR (MySQL from App tier)
+  Rule 200: Allow TCP 1024-65535 from VPC CIDR (return traffic)
+Outbound:
+  Rule 100: Allow TCP 1024-65535 to VPC CIDR ONLY (responses back)
+```
+
+> 📌 **Why both SGs AND NACLs?** Defense in depth. If someone misconfigures a Security Group, the NACL is still there as a safety net. NACLs are evaluated BEFORE SGs.
+
+### Additional Security Measures
+
+| Measure | Implementation | Why |
+|---------|---------------|-----|
+| **IMDSv2 Enforced** | `http_tokens = "required"` on all EC2 | Prevents SSRF attacks (like the Capital One breach) |
+| **EBS Encryption** | `encrypted = true` on all volumes | Data at rest protection — required for SOC2/HIPAA/PCI-DSS |
+| **RDS Encryption** | `storage_encrypted = true` | Database data encrypted with AWS KMS |
+| **Secrets Manager** | Auto-generated 24-char password | DB credentials never in code or Terraform state |
+| **IAM Least Privilege** | Only SSM + CloudWatch policies | EC2 instances can't access S3, RDS, or other services |
+| **VPC Flow Logs** | All traffic logged to CloudWatch | Network forensics and compliance auditing |
+| **WAF** | Rate limiting + managed rule sets | Blocks SQL injection, bad bots, DDoS attempts |
+
+---
+
+## 🔄 Auto Scaling Deep Dive
+
+### How Scaling Works
+
+```
+Normal Load              High Load (CPU > 70%)         Low Load (CPU < 30%)
+┌──────────┐             ┌──────────┐                  ┌──────────┐
+│ Instance │             │ Instance │                  │ Instance │
+│    1     │             │    1     │                  │    1     │
+├──────────┤             ├──────────┤                  ├──────────┤
+│ Instance │             │ Instance │                  │ Instance │
+│    2     │             │    2     │                  │    2     │
+└──────────┘             ├──────────┤                  └──────────┘
+min=2, desired=2         │ Instance │ ← NEW            desired=2 (back to min)
+                         │    3     │   (scale out)    Instance 3 terminated
+                         └──────────┘
+```
+
+### Scaling Policy Details
+
+| Parameter | Value | Explanation |
+|-----------|-------|-------------|
+| **Metric** | Average CPU | Across all instances in the ASG |
+| **Scale Out Threshold** | > 70% | For 2 consecutive periods of 120 seconds (4 min total) |
+| **Scale Out Action** | Add 1 instance | Conservative — prevents over-provisioning |
+| **Scale In Threshold** | < 30% | For 2 consecutive periods of 120 seconds |
+| **Scale In Action** | Remove 1 instance | Gradual scale-down |
+| **Cooldown** | 300 seconds (5 min) | Prevents rapid scaling oscillation |
+| **Health Check** | ELB-based | If ALB health check fails, instance is replaced |
+| **Grace Period** | 300 seconds | New instances get 5 min to bootstrap before health checks |
+
+### Instance Refresh (Zero-Downtime Deployments)
+
+When you update the launch template (new AMI, new user data), the ASG does a rolling replacement:
+```
+Strategy: Rolling
+Min Healthy: 50%
+
+Step 1: Terminate Instance 1 (old)
+Step 2: Launch Instance 1 (new) — wait for healthy
+Step 3: Terminate Instance 2 (old)
+Step 4: Launch Instance 2 (new) — wait for healthy
+Result: All instances updated, zero downtime
+```
+
+### Launch Template Configuration
+
+| Setting | Web Tier (Nginx) | App Tier (Tomcat) |
+|---------|-----------------|-------------------|
+| AMI | Amazon Linux 2023 (latest) | Amazon Linux 2023 (latest) |
+| Instance Type | t3.micro | t3.micro |
+| EBS Volume | 20 GB, gp3, encrypted | 30 GB, gp3, encrypted |
+| IMDSv2 | Required | Required |
+| User Data | `userdata-nginx.sh` | `userdata-tomcat.sh` |
+
+---
+
+## 🗄️ Database Deep Dive
+
+### Multi-AZ — How Failover Works
+
+```
+Normal Operation:
+┌─────────────────┐     ┌─────────────────┐
+│   AZ: us-east-1a│     │   AZ: us-east-1b│
+│  ┌───────────┐  │     │  ┌───────────┐  │
+│  │ RDS MySQL │  │────→│  │ RDS MySQL │  │
+│  │ (PRIMARY) │  │sync │  │ (STANDBY) │  │
+│  │ Read+Write│  │     │  │  No access │  │
+│  └───────────┘  │     │  └───────────┘  │
+└─────────────────┘     └─────────────────┘
+
+After AZ-1a Failure (automatic, ~60 seconds):
+┌─────────────────┐     ┌─────────────────┐
+│   AZ: us-east-1a│     │   AZ: us-east-1b│
+│  ┌───────────┐  │     │  ┌───────────┐  │
+│  │    DOWN    │  │     │  │ RDS MySQL │  │
+│  │           │  │     │  │ (PRIMARY) │  │ ← Promoted automatically
+│  │           │  │     │  │ Read+Write│  │
+│  └───────────┘  │     │  └───────────┘  │
+└─────────────────┘     └─────────────────┘
+```
+
+The DNS endpoint stays the same — your app doesn't need any code change. AWS flips the DNS to point to the new primary.
+
+### RDS Configuration
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| Engine | MySQL 8.0 | Latest stable, full Unicode (utf8mb4) |
+| Storage | gp3, 20GB initial | Latest gen SSD, auto-scales up to 100GB |
+| Backup Window | 03:00-04:00 UTC | Low traffic period |
+| Maintenance Window | Mon 04:00-05:00 UTC | Patches applied during low traffic |
+| Slow Query Log | Enabled (> 2 sec) | Performance bottleneck detection |
+| Logs Exported | Error + Slow Query → CloudWatch | Centralized troubleshooting |
+
+### Prod vs Dev/Staging Differences
+
+| Feature | Prod | Dev/Staging |
+|---------|------|-------------|
+| Deletion protection | ✅ Enabled | ❌ Disabled |
+| Final snapshot | ✅ Taken before destroy | ❌ Skipped |
+| Secrets Manager recovery | 30 days | 0 days (immediate delete) |
+| Backup retention | 7 days | 1-3 days |
+| Instance class | `db.t3.medium` | `db.t3.micro` |
+
+---
+
+## ⚖️ Load Balancer Deep Dive
+
+### Why TWO ALBs?
+
+```
+Option A (Bad):  External ALB → Tomcat directly
+  Problem: Tomcat exposed to raw internet traffic. No reverse proxy.
+           No security headers. No static content caching.
+
+Option B (Good): External ALB → Nginx → Internal ALB → Tomcat
+  Benefit: Nginx adds security headers, can cache static content,
+           can do SSL termination, rate limiting at app level.
+           Internal ALB distributes across Tomcat instances.
+           Clear separation of concerns.
+```
+
+### External ALB (Internet-Facing)
+
+```
+Listener: Port 80 (HTTP)
+  → Default Action: Forward to Web Target Group
+
+Web Target Group:
+  - Protocol: HTTP, Port: 80
+  - Targets: Nginx instances (registered by ASG automatically)
+  - Health Check:
+      Path: /
+      Interval: 30 seconds
+      Healthy threshold: 3 consecutive successes
+      Unhealthy threshold: 3 consecutive failures
+      Timeout: 5 seconds
+```
+
+- `drop_invalid_header_fields = true` — Prevents HTTP request smuggling attacks
+- Deletion protection enabled in prod — prevents accidental `terraform destroy`
+
+### Internal ALB
+
+- `internal = true` — No public IP, only accessible within VPC
+- Listens on port 8080, forwards to Tomcat target group
+- Same health check configuration as external ALB
+
+---
+
+## 🛡️ WAF Deep Dive
+
+The WAF sits in front of the External ALB with 4 rules:
+
+| Priority | Rule | What It Does |
+|----------|------|-------------|
+| 1 | **Rate Limiting** | Blocks any IP sending > 2000 requests in 5 minutes |
+| 2 | **AWS Common Rule Set** | Blocks known exploits (path traversal, bad bots, etc.) |
+| 3 | **SQL Injection Rule Set** | Blocks SQL injection patterns in query strings, body, headers |
+| 4 | **Known Bad Inputs** | Blocks requests with known malicious patterns (Log4j, etc.) |
+
+All rules have CloudWatch metrics enabled + sampled requests for debugging.
+
+---
+
+## 📊 Monitoring Deep Dive
+
+### CloudWatch Alarms
+
+| Alarm | Threshold | Action |
+|-------|-----------|--------|
+| Web CPU High | > 70% for 4 min | ASG scale out (add instance) |
+| Web CPU Low | < 30% for 4 min | ASG scale in (remove instance) |
+| App CPU High | > 70% for 4 min | ASG scale out |
+| App CPU Low | < 30% for 4 min | ASG scale in |
+| RDS CPU High | > 80% for 10 min | SNS email notification |
+| RDS Low Storage | < 5 GB free | SNS email notification |
+| RDS High Connections | > 100 connections | SNS email notification |
+| ALB 5xx Errors | > 10 in 5 min | SNS email notification |
+
+### CloudWatch Dashboard
+
+Pre-built dashboard with 4 real-time widgets:
+- Web Tier CPU utilization
+- App Tier CPU utilization
+- RDS CPU utilization
+- RDS Free Storage space
+
+### Log Groups
+
+```
+/aws/vpc/<project>-flow-logs     ← VPC Flow Logs (all network traffic)
+/aws/ec2/<project>/nginx         ← Nginx access + error logs
+/aws/ec2/<project>/tomcat        ← Tomcat catalina.out
+```
+
+### Custom Metrics (via CloudWatch Agent)
+
+AWS doesn't provide memory/disk metrics by default. The CloudWatch Agent collects:
+- `mem_used_percent` — Memory usage
+- `swap_used_percent` — Swap usage
+- `disk_used_percent` — Disk usage for root volume
+
+---
+
+## 🖥️ Bootstrap Scripts — What Happens on First Boot
+
+### Nginx Instance (`userdata-nginx.sh`)
+
+```
+1. yum update -y                          ← Patch the OS
+2. Install nginx + amazon-cloudwatch-agent
+3. Write /etc/nginx/conf.d/app.conf       ← Reverse proxy config:
+   - upstream backend → Internal ALB DNS:8080
+   - Security headers (X-Frame-Options, X-Content-Type-Options, XSS-Protection)
+   - /health endpoint for ALB health checks
+4. Remove default Nginx config            ← Security hardening
+5. Start Nginx via systemctl
+6. Configure + start CloudWatch Agent     ← Push logs + memory metrics
+```
+
+The `${internal_alb_dns}` is injected by Terraform's `templatefile()` — each Nginx instance automatically knows where to forward traffic.
+
+### Tomcat Instance (`userdata-tomcat.sh`)
+
+```
+1. yum update -y                          ← Patch the OS
+2. Install java-11-amazon-corretto
+3. Create tomcat user (non-root)          ← Never run as root
+4. Download Apache Tomcat 9.0.93
+5. Remove default webapps                 ← Remove docs, examples, host-manager
+                                             (known attack vectors)
+6. Create systemd service with JVM tuning:
+   - Xms512M (initial heap)
+   - Xmx1024M (max heap)
+   - UseG1GC (garbage collector)
+   - headless mode
+7. Start Tomcat via systemctl
+8. Configure + start CloudWatch Agent     ← Push catalina.out + memory metrics
 ```
 
 ---
@@ -300,99 +796,38 @@ terraform destroy -var-file=environments/prod/terraform.tfvars
 
 ---
 
-## 📦 Implementation Phases
+## 🌍 Environment Configuration
 
-### Phase 1 — Network & Foundation
-- VPC with CIDR `10.0.0.0/16`
-- 8 Subnets across 2 AZs:
-  - 2 Public subnets (Bastion Host, NAT Gateway, External ALB)
-  - 2 Private subnets — Web tier (Nginx)
-  - 2 Private subnets — App tier (Tomcat)
-  - 2 Private subnets — Data tier (RDS)
-- Internet Gateway + NAT Gateway (per AZ for HA)
-- Route tables with proper associations
+Three environments with different sizing:
 
-### Phase 2 — Security Configuration
-- **Security Groups**:
-  - Bastion SG: SSH (22) from trusted IPs only
-  - Web tier SG: HTTP (80) from External ALB SG only, SSH (22) from Bastion SG only
-  - App tier SG: Port 8080 from Web SG only, SSH (22) from Bastion SG only
-  - Data tier SG: Port 3306 from App SG only
-- **NACLs**: Stateless firewall rules per subnet tier
-- **IAM Roles**: EC2 instance profiles with least-privilege policies for CloudWatch, S3, and SSM
+| Setting | Dev | Staging | Prod |
+|---------|-----|---------|------|
+| VPC CIDR | `10.2.0.0/16` | `10.1.0.0/16` | `10.0.0.0/16` |
+| Web ASG | 1–2 instances | 1–3 instances | 2–6 instances |
+| App ASG | 1–2 instances | 1–3 instances | 2–6 instances |
+| RDS Instance | `db.t3.micro` | `db.t3.micro` | `db.t3.medium` |
+| Backup Retention | 1 day | 3 days | 7 days |
+| Deletion Protection | ❌ | ❌ | ✅ |
 
-### Phase 3 — Bastion Host Deployment
-- EC2 instance (`t3.micro`) in public subnet
-- Hardened with minimal packages and SSH key-based auth only
-- Security Group restricted to specific trusted CIDR ranges
-- Acts as SSH jump box to all private-tier instances (Nginx, Tomcat)
+Deploy any environment:
+```bash
+terraform apply -var-file=environments/dev/terraform.tfvars
+terraform apply -var-file=environments/staging/terraform.tfvars
+terraform apply -var-file=environments/prod/terraform.tfvars
+```
 
-### Phase 4 — Database Deployment
-- RDS MySQL `db.t3.medium` in Multi-AZ
-- Private DB subnet group (no public access)
-- Automated backups (7-day retention) with point-in-time recovery
-- Encryption at rest (AWS KMS)
+### What You Need to Change Before Deploying
 
-### Phase 5 — Application Deployment
-- **Tomcat**: Java 11, Spring Boot app served on port 8080 via systemd service (private subnet)
-- **Nginx**: Reverse proxy in private subnet, forwarding traffic to internal ALB → Tomcat backend
-- User data scripts for automated bootstrapping
-- All instances accessible only via Bastion Host
+Only **2 values** in the tfvars file:
 
-### Phase 6 — Load Balancing & Auto Scaling
-- **External ALB**: Internet-facing (public subnet), routes HTTP/HTTPS to Nginx target group (private subnet)
-- **Internal ALB**: Routes traffic from Nginx to Tomcat target group (private subnet)
-- **ASG Policies**: Scale out at 70% CPU, scale in at 30% CPU
-- Health checks: ELB-based with 300s grace period
+1. `key_pair_name` — Your EC2 key pair name (create one in AWS Console first)
+2. `allowed_ssh_cidrs` — Your IP address for SSH access (e.g., `["203.0.113.50/32"]`)
 
-### Phase 7 — CI/CD Integration
-- Git-based source control
-- SonarQube for static code analysis
-- JFrog Artifactory for Maven artifact storage
-- Pipeline-ready architecture for Jenkins/GitHub Actions
-
-### Phase 8 — Monitoring & Observability
-- CloudWatch Alarms: CPU, memory, disk, HTTP 5xx errors
-- Custom metrics via CloudWatch Agent (memory, swap usage)
-- Centralized logging: Tomcat `catalina.out` → CloudWatch Log Groups
-- CloudWatch Dashboard for real-time visibility
-
-### Phase 9 — Security & Compliance
-- Encryption at rest (EBS, RDS, S3) and in transit (TLS/SSL)
-- AWS WAF with rate-limiting and SQL injection protection
-- VPC Flow Logs enabled for network audit
-- AWS Shield Standard for DDoS protection
+And update `backend.tf` with your actual S3 bucket name for remote state.
 
 ---
 
-## 🔐 Security Architecture
-
-```
-Internet → WAF → External ALB (HTTPS/TLS) ──→ Nginx (Private Subnet)
-                                                    │
-                                              [SG: Allow 8080 from Web SG only]
-                                                    │
-                                              Internal ALB → Tomcat (Private Subnet)
-                                                    │
-                                              [SG: Allow 3306 from App SG only]
-                                                    │
-                                              RDS MySQL (Isolated Private Subnet)
-                                              [Encrypted at rest + in transit]
-
-SSH Access Path:
-  Admin → Bastion Host (Public Subnet) ──SSH──→ Nginx / Tomcat (Private Subnets)
-          [SG: SSH from trusted IPs only]        [SG: SSH from Bastion SG only]
-```
-
-- SSH access to private instances **only through Bastion Host** — no direct internet access
-- Bastion Host locked down to specific trusted IP ranges
-- Secrets managed via **AWS Secrets Manager** (DB credentials, API keys)
-- **VPC Flow Logs** → S3/CloudWatch for network forensics
-- **GuardDuty** enabled for threat detection
-
----
-
-## 📊 Estimated Monthly Cost
+## 💰 Estimated Monthly Cost
 
 | Resource | Specification | Est. Cost (USD) |
 |----------|--------------|-----------------|
@@ -410,7 +845,46 @@ SSH Access Path:
 
 ---
 
-## 🧪 Validation & Testing
+## 🔧 Day-to-Day Operations
+
+### SSH Access
+
+```bash
+# SSH into Nginx via Bastion
+ssh -i key.pem -J ec2-user@<bastion-ip> ec2-user@<nginx-private-ip>
+
+# SSH into Tomcat via Bastion
+ssh -i key.pem -J ec2-user@<bastion-ip> ec2-user@<tomcat-private-ip>
+```
+
+### Health Checks
+
+```bash
+# Test ALB endpoint
+curl -I http://$(terraform output -raw external_alb_dns)
+
+# Check target group health
+aws elbv2 describe-target-health --target-group-arn <arn>
+```
+
+### Scaling Operations
+
+```bash
+# View scaling activity
+aws autoscaling describe-scaling-activities --auto-scaling-group-name <asg-name>
+
+# Force instance refresh (rolling update)
+aws autoscaling start-instance-refresh --auto-scaling-group-name <asg-name>
+```
+
+### Database Operations
+
+```bash
+# Retrieve DB credentials from Secrets Manager
+aws secretsmanager get-secret-value --secret-id <project>-<env>-db-password
+```
+
+### Validation
 
 ```bash
 # Verify Terraform configuration
@@ -424,15 +898,6 @@ tfsec .
 
 # Cost estimation with Infracost
 infracost breakdown --path .
-
-# After deployment — test ALB endpoint
-curl -I http://$(terraform output -raw alb_dns_name)
-
-# SSH into Nginx via Bastion
-ssh -i <key.pem> -J ec2-user@<bastion-ip> ec2-user@<nginx-private-ip>
-
-# SSH into Tomcat via Bastion
-ssh -i <key.pem> -J ec2-user@<bastion-ip> ec2-user@<tomcat-private-ip>
 ```
 
 ---
@@ -442,10 +907,24 @@ ssh -i <key.pem> -J ec2-user@<bastion-ip> ec2-user@<tomcat-private-ip>
 | Issue | Command | Resolution |
 |-------|---------|------------|
 | Can't SSH to private instance | `ssh -i key.pem -J ec2-user@<bastion-ip> ec2-user@<private-ip>` | Verify Bastion SG allows SSH from your IP, private SG allows SSH from Bastion SG |
-| DB connectivity | `telnet <rds-endpoint> 3306` | Check app-tier SG allows 3306 from app SG |
+| DB connectivity from Tomcat | `telnet <rds-endpoint> 3306` | Check App SG allows 3306 from App SG, DB SG allows from App SG |
 | ALB health check failing | `aws elbv2 describe-target-health --target-group-arn <arn>` | Verify Nginx/Tomcat is running and SG allows ALB health checks |
-| ASG not scaling | `aws autoscaling describe-scaling-activities --auto-scaling-group-name <name>` | Check scaling policy thresholds and cooldown |
-| High CPU on Tomcat | `top -bn1` / `ps -eLf \| grep java \| wc -l` | Review JVM heap settings, check for thread leaks |
+| ASG not scaling | `aws autoscaling describe-scaling-activities --auto-scaling-group-name <name>` | Check scaling policy thresholds and cooldown period |
+| High CPU on Tomcat | `top -bn1` / `ps -eLf \| grep java \| wc -l` | Review JVM heap settings (-Xmx), check for thread leaks |
+| Nginx 502 Bad Gateway | `curl -v http://internal-alb-dns:8080` | Verify Internal ALB is healthy, Tomcat is running on 8080 |
+| CloudWatch metrics missing | `systemctl status amazon-cloudwatch-agent` | Restart agent, check IAM role has CloudWatch permissions |
+
+---
+
+## 📌 Out of Scope
+
+- Application code development or modification
+- Data migration from legacy systems
+- HTTPS/SSL certificate setup (ACM variable provided, implementation ready)
+- CloudFront CDN configuration (optional, mentioned in architecture)
+- ElastiCache caching layer (optional)
+- CI/CD pipeline configuration (architecture is pipeline-ready)
+- DNS configuration (Route 53)
 
 ---
 
