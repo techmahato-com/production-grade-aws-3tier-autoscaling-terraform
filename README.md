@@ -15,6 +15,100 @@
   <img src="docs/network-giagram.png" alt="AWS 3-Tier Architecture Diagram" width="100%"/>
 </p>
 
+```
+                         ┌──────────────┐
+                         │  CloudFront   │ (Optional CDN)
+                         └──────┬───────┘
+                                │
+                         ┌──────▼───────┐
+                         │   AWS WAF     │
+                         └──────┬───────┘
+                                │
+                    ┌───────────▼───────────┐
+                    │  Internet Gateway (IGW)│
+                    └───────────┬───────────┘
+                                │
+          ┌─────────────────────┼─────────────────────┐
+          │              Public Subnets                │
+          │  ┌────────────┐           ┌────────────┐  │
+          │  │  Bastion    │           │  Bastion    │  │
+          │  │  Host (AZ1) │           │  Host (AZ2) │  │
+          │  └─────┬──────┘           └─────┬──────┘  │
+          │        │    ┌──────────────┐    │         │
+          │        │    │ External ALB │    │         │
+          │        │    │(Internet-Facing)│  │         │
+          │        │    └──────┬───────┘    │         │
+          └────────┼───────────┼────────────┼─────────┘
+                   │           │            │
+          ┌────────▼───────────▼────────────▼─────────┐
+          │           Private Subnets (Web Tier)       │
+          │                                            │
+          │  ┌──── AZ: us-east-1a ────┐  ┌──── AZ: us-east-1b ────┐
+          │  │  ┌──────────────────┐  │  │  ┌──────────────────┐  │
+          │  │  │   Nginx (ASG)    │  │  │  │   Nginx (ASG)    │  │
+          │  │  └────────┬─────────┘  │  │  └────────┬─────────┘  │
+          │  └───────────┼────────────┘  └───────────┼────────────┘
+          └──────────────┼───────────────────────────┼─┘
+                         │                           │
+               ┌─────────▼───────────────────────────▼──┐
+               │          Internal ALB                   │
+               └─────────┬───────────────────────────┬──┘
+                         │                           │
+          ┌──────────────▼────────────┐  ┌───────────▼─────────────┐
+          │  Private Subnets (App)    │  │  Private Subnets (App)  │
+          │  ┌──────────────────┐     │  │  ┌──────────────────┐   │
+          │  │  Tomcat (ASG)    │     │  │  │  Tomcat (ASG)    │   │
+          │  └────────┬─────────┘     │  │  └────────┬─────────┘   │
+          └───────────┼───────────────┘  └───────────┼─────────────┘
+                      │                              │
+          ┌───────────▼──────────────────────────────▼──┐
+          │       Private Subnets (Data — Isolated)     │
+          │  ┌──────────────┐      ┌──────────────┐     │
+          │  │ RDS MySQL    │      │ RDS MySQL    │     │
+          │  │ (Primary)    │      │ (Standby)    │     │
+          │  └──────────────┘      └──────────────┘     │
+          └─────────────────────────────────────────────┘
+```
+
+---
+
+## 📋 Project Overview
+
+### Executive Summary
+
+The client intends to deploy a **production-grade Java-based web application** on AWS leveraging a secure, scalable, and highly available 3-tier architecture.
+
+The proposed solution is designed to:
+- ✅ Ensure **high availability** across multiple Availability Zones
+- ✅ Enable **dynamic scalability** using Auto Scaling Groups
+- ✅ Enforce **security best practices** across all layers
+- ✅ Integrate **CI/CD pipelines** for automated deployments
+
+> 📌 The solution adopts a multi-tier architecture with clear separation of presentation, application, and data layers, ensuring modular scalability and fault isolation.
+
+### Scope of Work
+
+DevOps Team will design and implement a cloud-native infrastructure on AWS for hosting the application, including:
+- Network architecture design (VPC, subnets, routing)
+- Compute layer provisioning (EC2 with Auto Scaling)
+- Load balancing and traffic distribution
+- Database deployment and configuration (Amazon RDS)
+- CI/CD pipeline integration
+- Monitoring, logging, and alerting setup
+- Security hardening and compliance alignment
+
+### Customer Requirements
+
+- Deploy Java application using a 3-tier architecture
+- Implement high availability and fault tolerance
+- Enable auto scaling based on workload demand
+- Integrate DevOps tools for CI/CD
+- Ensure secure and compliant infrastructure
+
+> 📌 The project leverages tools such as **Nginx**, **Apache Tomcat**, **Amazon RDS**, **SonarQube**, and **JFrog Artifactory** for a complete DevOps lifecycle.
+
+---
+
 ### Three Tiers
 
 | Tier | Component | Subnet | Scaling |
@@ -30,6 +124,85 @@
 | **Bastion Host** | Public | SSH jump box to access all private-tier instances |
 | **External ALB** | Public | Internet-facing load balancer routing traffic to Nginx |
 | **NAT Gateway** | Public | Outbound internet access for private subnets |
+
+---
+
+## 🏛️ Solution Architecture & Implementation
+
+### Target Architecture on AWS
+
+The proposed architecture consists of the following layers:
+
+**Presentation Layer**
+- Nginx Web Servers deployed in Auto Scaling Groups
+- Internet-facing Application Load Balancer
+- CloudFront (optional) for content delivery
+
+**Application Layer**
+- Apache Tomcat servers hosted on EC2 instances
+- Internal Load Balancer for service communication
+- Stateless application design for scalability
+
+**Data Layer**
+- Amazon RDS (MySQL) in Multi-AZ configuration
+- Automated backups and failover support
+- Optional caching layer using Amazon ElastiCache
+
+**DevOps & Integration Layer**
+- Source Code Management (Git-based repository)
+- Code Quality Analysis (SonarQube)
+- Artifact Management (JFrog Artifactory)
+
+> 📌 The architecture highlights segregation of public and private subnets, secure communication between layers, and integration with CI/CD tools.
+
+### Implementation Approach
+
+The implementation will be executed in structured phases:
+
+**Phase 1: Network & Foundation Setup**
+- Provision Virtual Private Cloud (VPC)
+- Configure public and private subnets across multiple AZs
+- Attach Internet Gateway and configure NAT Gateway
+- Establish route tables and network segmentation
+
+**Phase 2: Security Configuration**
+- Define Security Groups and Network ACLs
+- Configure IAM roles and policies with least privilege access
+- Implement secure access mechanisms (SSH via Bastion Host)
+
+**Phase 3: Database Deployment**
+- Deploy Amazon RDS MySQL instance (Multi-AZ)
+- Configure database parameters and storage
+- Enable automated backups and monitoring
+
+**Phase 4: Application Deployment**
+- Install and configure:
+  - Apache Tomcat (backend services)
+  - Nginx (frontend proxy)
+- Deploy application artifacts
+- Configure reverse proxy routing
+
+**Phase 5: Load Balancing & Auto Scaling**
+- Configure Application Load Balancer (ALB)
+- Create target groups and health checks
+- Implement Auto Scaling Groups with dynamic scaling policies
+
+**Phase 6: CI/CD Integration**
+- Integrate source repository with pipeline
+- Configure SonarQube for code quality checks
+- Setup artifact repository for build storage
+- Enable automated deployment pipelines
+
+**Phase 7: Monitoring & Observability**
+- Configure Amazon CloudWatch for metrics and logs
+- Set up alarms for system health and performance
+- Implement centralized logging strategy
+
+**Phase 8: Security & Compliance**
+- Enable encryption at rest and in transit
+- Implement AWS WAF and Shield (if required)
+- Enable VPC Flow Logs and audit logging
+- Apply security best practices across all layers
 
 ---
 
